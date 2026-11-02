@@ -323,8 +323,8 @@ def run_child_gr00t_worker(
     eager_policies: list[nn.Module] = []
     compiled_policies: list[Any] = []
     compile_ok = True
-    for dev in devices:
-        torch.accelerator.set_device_index((dev).index if hasattr(dev, 'index') and (dev).index is not None else int(str(dev).split(':')[-1]))
+    for d_i, dev in enumerate(devices):
+        torch.accelerator.set_device_index(d_i)
         pol = Gr00tN1d7TPUPolicy(dev).eval()
         eager_policies.append(pol)
         try:
@@ -333,6 +333,7 @@ def run_child_gr00t_worker(
             compile_ok = False
             log(0, f"WARN torch.compile fallback on {dev}: {exc}")
             compiled_policies.append(pol)
+    torch.accelerator.set_device_index(0)
 
     configs = [
         # (mode_name, exec_backend, n_cams, vlm_seq_len, flow_steps, batches, n_iters)
@@ -454,7 +455,7 @@ def run_child_gr00t_worker(
                     cluster_chunks_s = host_dp_chunks_s * num_hosts
                     cluster_actions_s = host_dp_actions_s * num_hosts
 
-                    # E2E latency with vision decode/resize (on-host CPU vs disaggregated AVX-512 offload)
+                    # E2E latency with vision decode/resize (on-host CPU vs disaggregated AVX-512 offload vs async pipelined)
                     e2e_local_p50 = p50 + local_pre_ms
                     e2e_disagg_p50 = p50 + disagg_rtt_ms
                     e2e_disagg_pipelined_p50 = max(p50, disagg_rtt_ms)
@@ -511,7 +512,8 @@ def run_child_gr00t_worker(
                         f"ClusterDP({cluster_dp})={row['cluster_action_chunks_per_s']} chunks/s",
                     )
             except Exception as exc:
-                err_msg = f"FAIL({type(exc).__name__}: {str(exc)[:200]})"
+                clean_exc = " ".join(str(exc).splitlines())[:180]
+                err_msg = f"FAIL({type(exc).__name__}: {clean_exc})"
                 log(0, f"  -> {err_msg}")
                 rows.append(
                     {
@@ -630,7 +632,8 @@ def main() -> int:
         "vision_preproc_ablation": preproc_map,
         "results": results,
     }
-    write_gr00t_summary(out_dir, args.bucket, args.slice_name, args.chip_type, args.num_hosts, args.cores_per_host, payload)
+    if results:
+        write_gr00t_summary(out_dir, args.bucket, args.slice_name, args.chip_type, args.num_hosts, args.cores_per_host, payload)
 
     if args.use_shm and local_dir.exists():
         shutil.rmtree(local_dir, ignore_errors=True)
