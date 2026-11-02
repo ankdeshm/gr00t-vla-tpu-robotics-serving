@@ -1,0 +1,48 @@
+{
+  "updated_at_utc": "2026-11-02T18:57:38.594031+00:00",
+  "model": "nvidia/GR00T-N1.7-3B",
+  "slice_name": "v7x-16",
+  "chip_type": "v7x",
+  "num_hosts": 4,
+  "cores_per_host": 8,
+  "cluster_dp_replicas": 32,
+  "worker_exit_code": 1,
+  "stage_info": {
+    "repo_id": "nvidia/GR00T-N1.7-3B",
+    "gcs_uri": "gs://YOUR_GCS_BUCKET/models/nvidia/GR00T-N1.7-3B",
+    "cached": true
+  },
+  "vision_preproc_ablation": {
+    "1": {
+      "num_cams": 1,
+      "resolution": "640x480->256x256",
+      "offload_ok": true,
+      "local_cpu_preproc_ms": 2.74,
+      "disagg_cpu_rtt_ms": 12.75,
+      "disagg_cpu_preproc_ms": 4.36,
+      "encoder_host": "multimodal-cpu-offload-svc-576cb9dcb7-v96g8",
+      "cpu_offload_speedup_x": 0.21
+    },
+    "2": {
+      "num_cams": 2,
+      "resolution": "640x480->256x256",
+      "offload_ok": true,
+      "local_cpu_preproc_ms": 5.14,
+      "disagg_cpu_rtt_ms": 14.96,
+      "disagg_cpu_preproc_ms": 5.34,
+      "encoder_host": "multimodal-cpu-offload-svc-576cb9dcb7-x5n8t",
+      "cpu_offload_speedup_x": 0.34
+    },
+    "4": {
+      "num_cams": 4,
+      "resolution": "640x480->256x256",
+      "offload_ok": true,
+      "local_cpu_preproc_ms": 10.28,
+      "disagg_cpu_rtt_ms": 18.53,
+      "disagg_cpu_preproc_ms": 7.16,
+      "encoder_host": "multimodal-cpu-offload-svc-576cb9dcb7-x5n8t",
+      "cpu_offload_speedup_x": 0.55
+    }
+  },
+  "results": []
+}

@@ -178,6 +178,9 @@ def run_child_gr00t_worker(
     cores_per_host: int,
     stage_info: dict[str, Any],
 ) -> None:
+    from tpu_single_host_setup import _patch_torchtpu_export_multidevice
+
+    _patch_torchtpu_export_multidevice()
     import torch
     import torch._dynamo
     import torch.nn as nn
@@ -186,10 +189,12 @@ def run_child_gr00t_worker(
     from safetensors import safe_open
 
     torch._dynamo.config.cache_size_limit = 256
+    if hasattr(torch._dynamo.config, "recompile_limit"):
+        torch._dynamo.config.recompile_limit = 64
     if hasattr(torch._dynamo.config, "accumulated_cache_size_limit"):
         torch._dynamo.config.accumulated_cache_size_limit = 1024
 
-    detected_devs = torch.tpu.device_count()
+    detected_devs = torch.accelerator.device_count()
     n_devs = min(detected_devs, cores_per_host) if cores_per_host > 0 else detected_devs
     assert n_devs >= 1, f"Expected >=1 TPU devices in single-client worker, got {detected_devs}"
     devices = [torch.device(f"tpu:{i}") for i in range(n_devs)]
@@ -215,11 +220,11 @@ def run_child_gr00t_worker(
 
     held_replicas: list[dict[str, torch.Tensor]] = []
     for d_i, dev in enumerate(devices):
-        torch.tpu.set_device(dev)
+        torch.accelerator.set_device_index((dev).index if hasattr(dev, 'index') and (dev).index is not None else int(str(dev).split(':')[-1]))
         rep_dict = {k: v.to(dev) for k, v in cpu_tensors.items()}
         held_replicas.append(rep_dict)
     del cpu_tensors
-    torch.tpu.synchronize()
+    torch.accelerator.synchronize()
     load_s = time.perf_counter() - t_l0
     loaded_gib = round(per_replica_bytes / (1024**3), 3)
     log(
@@ -319,7 +324,7 @@ def run_child_gr00t_worker(
     compiled_policies: list[Any] = []
     compile_ok = True
     for dev in devices:
-        torch.tpu.set_device(dev)
+        torch.accelerator.set_device_index((dev).index if hasattr(dev, 'index') and (dev).index is not None else int(str(dev).split(':')[-1]))
         pol = Gr00tN1d7TPUPolicy(dev).eval()
         eager_policies.append(pol)
         try:
@@ -374,22 +379,23 @@ def run_child_gr00t_worker(
             try:
                 with torch.no_grad():
                     # 1. Single-core real-time latency measurement on tpu:0
-                    torch.tpu.set_device(devices[0])
-                    vl0 = torch.randn((bsz, seq_len, d_vlm), device=devices[0], dtype=torch.bfloat16) * 0.02
-                    pr0 = torch.randn((bsz, 1, act_dim), device=devices[0], dtype=torch.bfloat16) * 0.02
-                    na0 = torch.randn((bsz, act_h, act_dim), device=devices[0], dtype=torch.bfloat16) * 0.02
+                    torch.accelerator.set_device_index(0)
+                    vl0 = (torch.randn((bsz, seq_len, d_vlm), device="cpu", dtype=torch.bfloat16) * 0.02).to(devices[0])
+                    pr0 = (torch.randn((bsz, 1, act_dim), device="cpu", dtype=torch.bfloat16) * 0.02).to(devices[0])
+                    na0 = (torch.randn((bsz, act_h, act_dim), device="cpu", dtype=torch.bfloat16) * 0.02).to(devices[0])
+                    torch.accelerator.synchronize()
                     for _ in range(3):
                         _ = fns[0](vl0, pr0, na0, flow_steps)
-                        torch.tpu.synchronize()
+                        torch.accelerator.synchronize()
 
                     lats_ms: list[float] = []
                     for _ in range(n_iters):
                         t0 = time.perf_counter()
                         out0 = fns[0](vl0, pr0, na0, flow_steps)
-                        torch.tpu.synchronize()
+                        torch.accelerator.synchronize()
                         lats_ms.append((time.perf_counter() - t0) * 1000.0)
                     del vl0, pr0, na0, out0
-                    torch.tpu.synchronize()
+                    torch.accelerator.synchronize()
 
                     lats_sorted = sorted(lats_ms)
                     p50 = statistics.median(lats_sorted)
@@ -401,35 +407,44 @@ def run_child_gr00t_worker(
                     vls: list[torch.Tensor] = []
                     prs: list[torch.Tensor] = []
                     nas: list[torch.Tensor] = []
+                    dp_fns: list[Any] = list(fns)
                     for d_i, dev in enumerate(devices):
-                        torch.tpu.set_device(dev)
-                        vls.append(torch.randn((bsz, seq_len, d_vlm), device=dev, dtype=torch.bfloat16) * 0.02)
-                        prs.append(torch.randn((bsz, 1, act_dim), device=dev, dtype=torch.bfloat16) * 0.02)
-                        nas.append(torch.randn((bsz, act_h, act_dim), device=dev, dtype=torch.bfloat16) * 0.02)
+                        torch.accelerator.set_device_index(d_i)
+                        vls.append((torch.randn((bsz, seq_len, d_vlm), device="cpu", dtype=torch.bfloat16) * 0.02).to(dev))
+                        prs.append((torch.randn((bsz, 1, act_dim), device="cpu", dtype=torch.bfloat16) * 0.02).to(dev))
+                        nas.append((torch.randn((bsz, act_h, act_dim), device="cpu", dtype=torch.bfloat16) * 0.02).to(dev))
+                        torch.accelerator.synchronize()
                         # Sequential warmup per device avoids concurrent Dynamo graph capture races
-                        for _ in range(2):
-                            _ = fns[d_i](vls[d_i], prs[d_i], nas[d_i], flow_steps)
-                        torch.tpu.synchronize()
+                        try:
+                            for _ in range(2):
+                                _ = dp_fns[d_i](vls[d_i], prs[d_i], nas[d_i], flow_steps)
+                                torch.accelerator.synchronize()
+                        except Exception as dp_exc:
+                            log(0, f"WARN compiled DP replica {d_i} fallback to eager: {dp_exc}")
+                            dp_fns[d_i] = eager_policies[d_i]
+                            for _ in range(2):
+                                _ = dp_fns[d_i](vls[d_i], prs[d_i], nas[d_i], flow_steps)
+                                torch.accelerator.synchronize()
 
                     dp_waves = max(8, n_iters // 2)
                     dp_wave_ms: list[float] = []
 
                     def _run_dp_replica(d_i: int) -> torch.Tensor:
-                        torch.tpu.set_device(devices[d_i])
-                        return fns[d_i](vls[d_i], prs[d_i], nas[d_i], flow_steps)
+                        torch.accelerator.set_device_index(d_i)
+                        return dp_fns[d_i](vls[d_i], prs[d_i], nas[d_i], flow_steps)
 
                     with concurrent.futures.ThreadPoolExecutor(max_workers=n_devs) as pool:
                         # 1 concurrent warmup wave
                         list(pool.map(_run_dp_replica, range(n_devs)))
-                        torch.tpu.synchronize()
+                        torch.accelerator.synchronize()
                         for _ in range(dp_waves):
                             t_w0 = time.perf_counter()
                             list(pool.map(_run_dp_replica, range(n_devs)))
-                            torch.tpu.synchronize()
+                            torch.accelerator.synchronize()
                             dp_wave_ms.append((time.perf_counter() - t_w0) * 1000.0)
 
                     del vls, prs, nas
-                    torch.tpu.synchronize()
+                    torch.accelerator.synchronize()
 
                     dp_sorted = sorted(dp_wave_ms)
                     dp_p50_ms = statistics.median(dp_sorted)
