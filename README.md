@@ -12,7 +12,7 @@ nvidia/GR00T-N1.7-3B Humanoid Robot Vision-Language-Action (VLA) Real-Time Contr
 | **Architecture** | `SigLip2` Vision Encoder (`1 / 2 / 4` RGB views) + `Cosmos-Reason2-2B` VLM (`16K / 64K` context) + `32`-Layer Flow-Matching Action DiT (`4 / 8` steps) |
 | **Real-Time Robotics SLAs** | `50 Hz` Closed-Loop Control (`P99 < 20 ms`) and `20 Hz` Manipulation Control (`P99 < 50 ms`) across `B=1..32` |
 | **TPU Execution** | Single-Client Multi-Device `TorchTPU` (`DP=4`/host on `v5p`, `DP=8`/host on `v7x`), `torch.compile(..., dynamic=False)` vs Eager |
-| **Disaggregated CPU Offload** | `multimodal-cpu-offload-svc` (`c3-standard-44` AVX-512): double-buffered `POST /preprocess_vision` multi-camera RGB decode/resize/normalize |
+| **Disaggregated CPU Offload** | `multimodal-cpu-offload-svc` (`c3-standard-44` AVX-512, `HTTP/1.1 Keep-Alive + TCP_NODELAY`): double-buffered `POST /preprocess_vision` (`6.68 ms` 2-Cam RTT) |
 
 ---
 
@@ -36,13 +36,14 @@ Non-TPU media muxing, high-resolution image compression, and multi-camera/multi-
 
 ---
 
-## 4. Before vs. After Disaggregated Vision Preprocessing & Cross-Generation (`v5p` vs `v7x`) Optimization
+## 4. Before vs. After Disaggregated Vision Preprocessing (`Keep-Alive + TCP_NODELAY`) & Cross-Generation (`v5p` vs `v7x`) Optimization
 
-Direct A/B comparison across `v5p-16`, `v7x-4`, and `v7x-16` evaluating **synchronous on-host OpenCV/Pillow vision preprocessing** vs. **disaggregated AVX-512 server compute (`multimodal-cpu-offload-svc:8090`) with double-buffered async pipelining** and `torch.compile`:
+Direct A/B comparison across `v5p-16` (`Wave-1` vs `Wave-3 Keep-Alive`), `v7x-4`, and `v7x-16` evaluating **synchronous on-host OpenCV/Pillow vision preprocessing** vs. **persistent `HTTP/1.1 Keep-Alive + TCP_NODELAY` disaggregated AVX-512 compute (`multimodal-cpu-offload-svc:8090`) with double-buffered async pipelining** and `torch.compile`:
 
-| Evaluation Scenario | Before (On-Host Sync CPU / Baseline) | After (Pipelined Disagg CPU + `torch.compile` on `v7x`) | Measured Gain | Code & Result References |
+| Evaluation Scenario | Before (On-Host Sync CPU / Unpooled HTTP) | After (`Keep-Alive + TCP_NODELAY` + Pipelined Disagg CPU) | Measured Gain | Code & Result References |
 |---|---:|---:|---:|---|
-| **`4`-Camera `640x480 -> 256x256` Vision Compute** | `14.33 ms` on TPU host CPU | **`7.11 ms`** on `c3-standard-44` AVX-512 (`0.0 ms` exposed when pipelined) | **`2.02x` faster server compute** (`100%` overlapped) | [`multimodal_cpu_offload_server.py`](./scripts/multimodal_cpu_offload_server.py) · [`v5p-16/summary.json`](./results/v5p-16/summary.json) |
+| **`2`-Camera `640x480 -> 256x256` HTTP RTT (`Wave-3`)** | `18.69 ms` unpooled HTTP (`7.18 ms` local CPU) | **`6.68 ms` Keep-Alive RTT** (`0.0 ms` exposed when pipelined) | **`2.80x` lower HTTP RTT** (beats local CPU even sync!) | [`cpu_offload_client.py`](./scripts/cpu_offload_client.py) · [`v5p-16-wave3-keepalive/summary.json`](./results/v5p-16-wave3-keepalive/summary.json) |
+| **`4`-Camera `640x480 -> 256x256` Vision Compute** | `14.31 – 14.33 ms` on TPU host CPU | **`11.79 ms` Keep-Alive RTT** (`7.11 ms` server compute; `0.0 ms` pipelined) | **`1.21x` faster sync · `2.02x` server compute** (`-14.31 ms` pipelined) | [`multimodal_cpu_offload_server.py`](./scripts/multimodal_cpu_offload_server.py) · [`v5p-16-wave3-keepalive/summary.json`](./results/v5p-16-wave3-keepalive/summary.json) |
 | **`2Cam-4step` (`B=8`) `20 Hz` Control Loop (`v7x-16`)** | `53.31 ms` E2E sync local (**misses** `<50 ms` SLA) | **`48.06 ms`** E2E pipelined offload (**meets `<50 ms` `20 Hz` SLA!**) | **`-5.25 ms` E2E** (unlocks `B=8` `20 Hz` SLA) | [`run_gr00t_vla_tpu_bench.py`](./scripts/run_gr00t_vla_tpu_bench.py) · [`v7x-16/summary.json`](./results/v7x-16/summary.json) |
 | **`1Cam / 4Cam` (`B=1`) Real-Time Control (`v7x` vs `v5p`)** | `46.55 ms` (`v5p-16` sync local) | **`40.01 – 40.33 ms`** (`v7x-spot-4c` & `v7x-16` pipelined) | **`1.16x` lower latency** (`<50 ms` across `1–4` cams) | [`v7x-spot-4c/summary.json`](./results/v7x-spot-4c/summary.json) · [`v7x-16/summary.json`](./results/v7x-16/summary.json) |
 | **`64K` Long-Episode Memory (`B=1`, `4`-step)** | `2,562.65 ms` (`v5p-16` sync local) | **`2,443.85 ms`** (`v7x-16` pipelined, `4,288 actions/s` cluster) | **`1.40x` higher 16-chip fleet throughput** | [`v5p-16/summary.json`](./results/v5p-16/summary.json) · [`v7x-16/summary.json`](./results/v7x-16/summary.json) |
@@ -90,6 +91,80 @@ Every table below is generated directly from the verified `PASS` records in [`re
 | `2` | `640x480->256x256` | `7.22` | **`5.34`** | **`1.35x`** | `16.48` | **`0.00` *(hidden behind DiT)*** |
 | `4` | `640x480->256x256` | `14.34` | **`7.18`** | **`2.00x`** | `11.96` | **`0.00` *(hidden behind DiT)*** |
 
+### Slice `v5p-16-wave3-keepalive` (`v5p`, `16` DP Replicas, `20` Verified Benchmark Points)
+
+- **Raw Artifacts:** [`results/v5p-16-wave3-keepalive/SUMMARY.md`](./results/v5p-16-wave3-keepalive/SUMMARY.md) · [`results/v5p-16-wave3-keepalive/summary.json`](./results/v5p-16-wave3-keepalive/summary.json) *(updated `2026-11-02T20:16:31.737161+00:00`)*
+
+#### End-to-End VLA Control Latency & Multi-Robot Fleet Throughput
+
+| Workload Mode | Backend | Cams | VLM Seq | Steps | Batch | TPU P50 (ms) | TPU P99 (ms) | E2E Sync Local (ms) | E2E Pipelined Offload (ms) | `20 Hz` SLA (`<50 ms`) | Cluster Actions/s |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|
+| `RealtimeControl-2Cam-4step` | `torchtpu-compiled` | `2` | `640` | `4` | `8` | **`50.64`** | `50.82` | `57.82` | **`50.64`** | Throughput Tier | **`22,129.0`** |
+| `RealtimeControl-2Cam-4step` | `torchtpu-compiled` | `2` | `640` | `4` | `16` | **`159.76`** | `160.51` | `166.94` | **`159.76`** | Throughput Tier | **`78,877.7`** |
+| `RealtimeControl-2Cam-4step` | `torchtpu-compiled` | `2` | `640` | `4` | `32` | **`304.75`** | `305.09` | `311.93` | **`304.75`** | Throughput Tier | **`143,045.3`** |
+| `RealtimeControl-2Cam-4step-Eager` | `torchtpu-xla-eager` | `2` | `640` | `4` | `1` | **`55.32`** | `64.18` | `62.50` | **`55.32`** | Throughput Tier | **`4,536.5`** |
+| `RealtimeControl-2Cam-4step-Eager` | `torchtpu-xla-eager` | `2` | `640` | `4` | `8` | **`87.90`** | `89.36` | `95.08` | **`87.90`** | Throughput Tier | **`45,597.7`** |
+| `MultiCam-1Cam-4step` | `torchtpu-compiled` | `1` | `384` | `4` | `1` | **`117.68`** | `120.51` | `121.35` | **`117.68`** | Throughput Tier | **`5,568.1`** |
+| `MultiCam-1Cam-4step` | `torchtpu-compiled` | `1` | `384` | `4` | `2` | **`56.67`** | `75.42` | `60.34` | **`56.67`** | Throughput Tier | **`11,363.3`** |
+| `MultiCam-1Cam-4step` | `torchtpu-compiled` | `1` | `384` | `4` | `4` | **`61.31`** | `63.20` | `64.98` | **`61.31`** | Throughput Tier | **`22,412.2`** |
+| `MultiCam-1Cam-4step` | `torchtpu-compiled` | `1` | `384` | `4` | `8` | **`72.20`** | `105.07` | `75.87` | **`72.20`** | Throughput Tier | **`45,161.2`** |
+| `MultiCam-1Cam-4step` | `torchtpu-compiled` | `1` | `384` | `4` | `16` | **`118.29`** | `120.58` | `121.96` | **`118.29`** | Throughput Tier | **`69,980.7`** |
+| `MultiCam-1Cam-4step` | `torchtpu-compiled` | `1` | `384` | `4` | `32` | **`222.45`** | `222.59` | `226.12` | **`222.45`** | Throughput Tier | **`179,465.1`** |
+| `MultiCam-4Cam-4step` | `torchtpu-compiled` | `4` | `1,152` | `4` | `1` | **`57.48`** | `59.25` | `71.79` | **`57.48`** | Throughput Tier | **`5,555.0`** |
+| `MultiCam-4Cam-4step` | `torchtpu-compiled` | `4` | `1,152` | `4` | `4` | **`80.36`** | `82.13` | `94.67` | **`80.36`** | Throughput Tier | **`22,525.6`** |
+| `MultiCam-4Cam-4step` | `torchtpu-compiled` | `4` | `1,152` | `4` | `8` | **`129.83`** | `135.30` | `144.14` | **`129.83`** | Throughput Tier | **`45,290.9`** |
+| `MultiCam-4Cam-4step` | `torchtpu-compiled` | `4` | `1,152` | `4` | `16` | **`236.98`** | `237.09` | `251.29` | **`236.98`** | Throughput Tier | **`89,231.2`** |
+| `HighPrecision-2Cam-8step` | `torchtpu-compiled` | `2` | `640` | `8` | `1` | **`116.38`** | `226.32` | `123.56` | **`116.38`** | Throughput Tier | **`3,016.8`** |
+| `HighPrecision-2Cam-8step` | `torchtpu-compiled` | `2` | `640` | `8` | `8` | **`139.45`** | `147.04` | `146.63` | **`139.45`** | Throughput Tier | **`24,266.9`** |
+| `HighPrecision-2Cam-8step` | `torchtpu-compiled` | `2` | `640` | `8` | `16` | **`247.92`** | `253.15` | `255.10` | **`247.92`** | Throughput Tier | **`48,861.0`** |
+| `LongEpisodeMemory-16K-Context-4step` | `torchtpu-compiled` | `2` | `16,384` | `4` | `1` | **`278.37`** | `280.51` | `285.55` | **`278.37`** | Throughput Tier | **`5,012.9`** |
+| `LongEpisodeMemory-64K-Context-4step` | `torchtpu-compiled` | `2` | `65,536` | `4` | `1` | **`2,555.07`** | `2,555.43` | `2,562.25` | **`2,555.07`** | Throughput Tier | **`3,807.7`** |
+
+#### Multi-Camera RGB Vision Preprocessing Ablation (`640x480 -> 256x256`)
+
+| Camera Views | Transform | On-Host CPU (ms) | Disagg Server Compute (ms) | Server Compute Speedup | Sync HTTP RTT (ms) | Async Pipelined Exposed (ms) |
+|---:|---|---:|---:|---:|---:|---:|
+| `1` | `640x480->256x256` | `3.67` | **`4.23`** | **`0.87x`** | `5.22` | **`0.00` *(hidden behind DiT)*** |
+| `2` | `640x480->256x256` | `7.18` | **`5.32`** | **`1.35x`** | `6.68` | **`0.00` *(hidden behind DiT)*** |
+| `4` | `640x480->256x256` | `14.31` | **`9.75`** | **`1.47x`** | `11.79` | **`0.00` *(hidden behind DiT)*** |
+
+### Slice `v5p-16-wave4-adaptive64k` (`v5p`, `16` DP Replicas, `20` Verified Benchmark Points)
+
+- **Raw Artifacts:** [`results/v5p-16-wave4-adaptive64k/SUMMARY.md`](./results/v5p-16-wave4-adaptive64k/SUMMARY.md) · [`results/v5p-16-wave4-adaptive64k/summary.json`](./results/v5p-16-wave4-adaptive64k/summary.json) *(updated `2026-11-02T21:03:23.460638+00:00`)*
+
+#### End-to-End VLA Control Latency & Multi-Robot Fleet Throughput
+
+| Workload Mode | Backend | Cams | VLM Seq | Steps | Batch | TPU P50 (ms) | TPU P99 (ms) | E2E Sync Local (ms) | E2E Pipelined Offload (ms) | `20 Hz` SLA (`<50 ms`) | Cluster Actions/s |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|
+| `RealtimeControl-2Cam-4step` | `torchtpu-compiled` | `2` | `640` | `4` | `8` | **`50.51`** | `50.58` | `57.79` | **`50.51`** | Throughput Tier | **`22,496.8`** |
+| `RealtimeControl-2Cam-4step` | `torchtpu-compiled` | `2` | `640` | `4` | `16` | **`159.54`** | `160.16` | `166.82` | **`159.54`** | Throughput Tier | **`91,371.0`** |
+| `RealtimeControl-2Cam-4step` | `torchtpu-compiled` | `2` | `640` | `4` | `32` | **`304.68`** | `313.47` | `311.96` | **`304.68`** | Throughput Tier | **`180,691.1`** |
+| `RealtimeControl-2Cam-4step-Eager` | `torchtpu-xla-eager` | `2` | `640` | `4` | `1` | **`56.52`** | `57.91` | `63.80` | **`56.52`** | Throughput Tier | **`5,392.3`** |
+| `RealtimeControl-2Cam-4step-Eager` | `torchtpu-xla-eager` | `2` | `640` | `4` | `8` | **`88.29`** | `108.72` | `95.57` | **`88.29`** | Throughput Tier | **`45,346.8`** |
+| `MultiCam-1Cam-4step` | `torchtpu-compiled` | `1` | `384` | `4` | `1` | **`57.66`** | `61.58` | `61.31` | **`57.66`** | Throughput Tier | **`5,668.6`** |
+| `MultiCam-1Cam-4step` | `torchtpu-compiled` | `1` | `384` | `4` | `2` | **`63.41`** | `73.62` | `67.06` | **`63.41`** | Throughput Tier | **`11,221.5`** |
+| `MultiCam-1Cam-4step` | `torchtpu-compiled` | `1` | `384` | `4` | `4` | **`63.65`** | `67.38` | `67.30` | **`63.65`** | Throughput Tier | **`22,443.0`** |
+| `MultiCam-1Cam-4step` | `torchtpu-compiled` | `1` | `384` | `4` | `8` | **`73.97`** | `78.36` | `77.62` | **`73.97`** | Throughput Tier | **`42,688.1`** |
+| `MultiCam-1Cam-4step` | `torchtpu-compiled` | `1` | `384` | `4` | `16` | **`136.76`** | `140.14` | `140.41` | **`136.76`** | Throughput Tier | **`88,963.4`** |
+| `MultiCam-1Cam-4step` | `torchtpu-compiled` | `1` | `384` | `4` | `32` | **`222.43`** | `222.53` | `226.08` | **`222.43`** | Throughput Tier | **`182,974.0`** |
+| `MultiCam-4Cam-4step` | `torchtpu-compiled` | `4` | `1,152` | `4` | `1` | **`60.81`** | `71.32` | `75.17` | **`60.81`** | Throughput Tier | **`5,805.2`** |
+| `MultiCam-4Cam-4step` | `torchtpu-compiled` | `4` | `1,152` | `4` | `4` | **`80.48`** | `82.35` | `94.84` | **`80.48`** | Throughput Tier | **`22,979.0`** |
+| `MultiCam-4Cam-4step` | `torchtpu-compiled` | `4` | `1,152` | `4` | `8` | **`124.39`** | `126.05` | `138.75` | **`124.39`** | Throughput Tier | **`46,268.2`** |
+| `MultiCam-4Cam-4step` | `torchtpu-compiled` | `4` | `1,152` | `4` | `16` | **`237.01`** | `237.10` | `251.37` | **`237.01`** | Throughput Tier | **`83,947.7`** |
+| `HighPrecision-2Cam-8step` | `torchtpu-compiled` | `2` | `640` | `8` | `1` | **`108.13`** | `116.27` | `115.41` | **`108.13`** | Throughput Tier | **`2,920.8`** |
+| `HighPrecision-2Cam-8step` | `torchtpu-compiled` | `2` | `640` | `8` | `8` | **`138.44`** | `139.77` | `145.72` | **`138.44`** | Throughput Tier | **`19,102.7`** |
+| `HighPrecision-2Cam-8step` | `torchtpu-compiled` | `2` | `640` | `8` | `16` | **`247.74`** | `266.18` | `255.02` | **`247.74`** | Throughput Tier | **`48,321.1`** |
+| `LongEpisodeMemory-16K-Context-4step` | `torchtpu-compiled` | `2` | `16,384` | `4` | `1` | **`278.32`** | `280.43` | `285.60` | **`278.32`** | Throughput Tier | **`5,147.6`** |
+| `LongEpisodeMemory-64K-Context-4step` | `torchtpu-compiled` | `2` | `65,536` | `4` | `1` | **`2,554.72`** | `2,555.46` | `2,562.00` | **`2,554.72`** | Throughput Tier | **`3,669.8`** |
+
+#### Multi-Camera RGB Vision Preprocessing Ablation (`640x480 -> 256x256`)
+
+| Camera Views | Transform | On-Host CPU (ms) | Disagg Server Compute (ms) | Server Compute Speedup | Sync HTTP RTT (ms) | Async Pipelined Exposed (ms) |
+|---:|---|---:|---:|---:|---:|---:|
+| `1` | `640x480->256x256` | `3.65` | **`4.15`** | **`0.88x`** | `5.54` | **`0.00` *(hidden behind DiT)*** |
+| `2` | `640x480->256x256` | `7.28` | **`5.42`** | **`1.34x`** | `7.09` | **`0.00` *(hidden behind DiT)*** |
+| `4` | `640x480->256x256` | `14.36` | **`9.82`** | **`1.46x`** | `12.15` | **`0.00` *(hidden behind DiT)*** |
+
 ### Slice `v7x-16` (`v7x`, `32` DP Replicas, `20` Verified Benchmark Points)
 
 - **Raw Artifacts:** [`results/v7x-16/SUMMARY.md`](./results/v7x-16/SUMMARY.md) · [`results/v7x-16/summary.json`](./results/v7x-16/summary.json) *(updated `2026-11-02T19:40:01.289150+00:00`)*
@@ -129,40 +204,40 @@ Every table below is generated directly from the verified `PASS` records in [`re
 
 ### Slice `v7x-8` (`v7x`, `16` DP Replicas, `20` Verified Benchmark Points)
 
-- **Raw Artifacts:** [`results/v7x-8/SUMMARY.md`](./results/v7x-8/SUMMARY.md) · [`results/v7x-8/summary.json`](./results/v7x-8/summary.json) *(updated `2026-11-02T20:04:30.279918+00:00`)*
+- **Raw Artifacts:** [`results/v7x-8/SUMMARY.md`](./results/v7x-8/SUMMARY.md) · [`results/v7x-8/summary.json`](./results/v7x-8/summary.json) *(updated `2026-11-02T20:56:34.131933+00:00`)*
 
 #### End-to-End VLA Control Latency & Multi-Robot Fleet Throughput
 
 | Workload Mode | Backend | Cams | VLM Seq | Steps | Batch | TPU P50 (ms) | TPU P99 (ms) | E2E Sync Local (ms) | E2E Pipelined Offload (ms) | `20 Hz` SLA (`<50 ms`) | Cluster Actions/s |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|
-| `RealtimeControl-2Cam-4step` | `torchtpu-compiled` | `2` | `640` | `4` | `8` | **`48.18`** | `48.42` | `53.36` | **`48.18`** | PASS (`<50 ms`) | **`11,941.4`** |
-| `RealtimeControl-2Cam-4step` | `torchtpu-compiled` | `2` | `640` | `4` | `16` | **`148.14`** | `149.73` | `153.32` | **`148.14`** | Throughput Tier | **`44,813.8`** |
-| `RealtimeControl-2Cam-4step` | `torchtpu-compiled` | `2` | `640` | `4` | `32` | **`275.59`** | `275.70` | `280.77` | **`275.59`** | Throughput Tier | **`88,767.0`** |
-| `RealtimeControl-2Cam-4step-Eager` | `torchtpu-xla-eager` | `2` | `640` | `4` | `1` | **`39.99`** | `41.24` | `45.17` | **`39.99`** | PASS (`<50 ms`) | **`2,737.5`** |
-| `RealtimeControl-2Cam-4step-Eager` | `torchtpu-xla-eager` | `2` | `640` | `4` | `8` | **`82.51`** | `84.62` | `87.69` | **`82.51`** | Throughput Tier | **`21,958.1`** |
-| `MultiCam-1Cam-4step` | `torchtpu-compiled` | `1` | `384` | `4` | `1` | **`43.03`** | `49.69` | `45.68` | **`43.03`** | PASS (`<50 ms`) | **`2,651.9`** |
-| `MultiCam-1Cam-4step` | `torchtpu-compiled` | `1` | `384` | `4` | `2` | **`39.58`** | `42.49` | `42.23` | **`39.58`** | PASS (`<50 ms`) | **`5,296.0`** |
-| `MultiCam-1Cam-4step` | `torchtpu-compiled` | `1` | `384` | `4` | `4` | **`43.98`** | `50.15` | `46.63` | **`43.98`** | PASS (`<50 ms`) | **`10,800.3`** |
-| `MultiCam-1Cam-4step` | `torchtpu-compiled` | `1` | `384` | `4` | `8` | **`69.20`** | `71.32` | `71.85` | **`69.20`** | Throughput Tier | **`21,758.4`** |
-| `MultiCam-1Cam-4step` | `torchtpu-compiled` | `1` | `384` | `4` | `16` | **`122.48`** | `122.79` | `125.13` | **`122.48`** | Throughput Tier | **`41,615.5`** |
-| `MultiCam-1Cam-4step` | `torchtpu-compiled` | `1` | `384` | `4` | `32` | **`222.98`** | `223.15` | `225.63` | **`222.98`** | Throughput Tier | **`84,275.5`** |
-| `MultiCam-4Cam-4step` | `torchtpu-compiled` | `4` | `1,152` | `4` | `1` | **`40.92`** | `43.26` | `51.21` | **`40.92`** | PASS (`<50 ms`) | **`2,638.9`** |
-| `MultiCam-4Cam-4step` | `torchtpu-compiled` | `4` | `1,152` | `4` | `4` | **`63.10`** | `66.42` | `73.39` | **`63.10`** | Throughput Tier | **`10,597.2`** |
-| `MultiCam-4Cam-4step` | `torchtpu-compiled` | `4` | `1,152` | `4` | `8` | **`108.95`** | `109.03` | `119.24` | **`108.95`** | Throughput Tier | **`21,642.5`** |
-| `MultiCam-4Cam-4step` | `torchtpu-compiled` | `4` | `1,152` | `4` | `16` | **`201.09`** | `201.31` | `211.38` | **`201.09`** | Throughput Tier | **`44,385.1`** |
-| `HighPrecision-2Cam-8step` | `torchtpu-compiled` | `2` | `640` | `8` | `1` | **`77.18`** | `84.56` | `82.36` | **`77.18`** | Throughput Tier | **`1,389.3`** |
-| `HighPrecision-2Cam-8step` | `torchtpu-compiled` | `2` | `640` | `8` | `8` | **`142.22`** | `144.25` | `147.40` | **`142.22`** | Throughput Tier | **`11,998.5`** |
-| `HighPrecision-2Cam-8step` | `torchtpu-compiled` | `2` | `640` | `8` | `16` | **`253.85`** | `254.37` | `259.03` | **`253.85`** | Throughput Tier | **`24,293.6`** |
-| `LongEpisodeMemory-16K-Context-4step` | `torchtpu-compiled` | `2` | `16,384` | `4` | `1` | **`237.10`** | `239.44` | `242.28` | **`237.10`** | Throughput Tier | **`2,543.7`** |
-| `LongEpisodeMemory-64K-Context-4step` | `torchtpu-compiled` | `2` | `65,536` | `4` | `1` | **`2,459.52`** | `2,459.85` | `2,464.70` | **`2,459.52`** | Throughput Tier | **`1,799.9`** |
+| `RealtimeControl-2Cam-4step` | `torchtpu-compiled` | `2` | `640` | `4` | `8` | **`48.04`** | `48.57` | `53.18` | **`48.04`** | PASS (`<50 ms`) | **`12,135.3`** |
+| `RealtimeControl-2Cam-4step` | `torchtpu-compiled` | `2` | `640` | `4` | `16` | **`148.03`** | `148.30` | `153.17` | **`148.03`** | Throughput Tier | **`41,733.8`** |
+| `RealtimeControl-2Cam-4step` | `torchtpu-compiled` | `2` | `640` | `4` | `32` | **`275.55`** | `275.63` | `280.69` | **`275.55`** | Throughput Tier | **`87,272.7`** |
+| `RealtimeControl-2Cam-4step-Eager` | `torchtpu-xla-eager` | `2` | `640` | `4` | `1` | **`43.62`** | `47.44` | `48.76` | **`43.62`** | PASS (`<50 ms`) | **`2,629.9`** |
+| `RealtimeControl-2Cam-4step-Eager` | `torchtpu-xla-eager` | `2` | `640` | `4` | `8` | **`82.67`** | `86.84` | `87.81` | **`82.67`** | Throughput Tier | **`22,134.4`** |
+| `MultiCam-1Cam-4step` | `torchtpu-compiled` | `1` | `384` | `4` | `1` | **`38.90`** | `45.54` | `41.52` | **`38.90`** | PASS (`<50 ms`) | **`2,494.0`** |
+| `MultiCam-1Cam-4step` | `torchtpu-compiled` | `1` | `384` | `4` | `2` | **`61.78`** | `67.75` | `64.40` | **`61.78`** | Throughput Tier | **`5,309.7`** |
+| `MultiCam-1Cam-4step` | `torchtpu-compiled` | `1` | `384` | `4` | `4` | **`43.96`** | `45.06` | `46.58` | **`43.96`** | PASS (`<50 ms`) | **`10,435.5`** |
+| `MultiCam-1Cam-4step` | `torchtpu-compiled` | `1` | `384` | `4` | `8` | **`68.93`** | `69.65` | `71.55` | **`68.93`** | Throughput Tier | **`20,441.1`** |
+| `MultiCam-1Cam-4step` | `torchtpu-compiled` | `1` | `384` | `4` | `16` | **`122.45`** | `123.12` | `125.07` | **`122.45`** | Throughput Tier | **`40,387.9`** |
+| `MultiCam-1Cam-4step` | `torchtpu-compiled` | `1` | `384` | `4` | `32` | **`222.97`** | `223.11` | `225.59` | **`222.97`** | Throughput Tier | **`86,680.2`** |
+| `MultiCam-4Cam-4step` | `torchtpu-compiled` | `4` | `1,152` | `4` | `1` | **`42.06`** | `46.45` | `52.23` | **`42.06`** | PASS (`<50 ms`) | **`2,733.7`** |
+| `MultiCam-4Cam-4step` | `torchtpu-compiled` | `4` | `1,152` | `4` | `4` | **`62.90`** | `65.65` | `73.07` | **`62.90`** | Throughput Tier | **`10,640.1`** |
+| `MultiCam-4Cam-4step` | `torchtpu-compiled` | `4` | `1,152` | `4` | `8` | **`108.92`** | `109.09` | `119.09` | **`108.92`** | Throughput Tier | **`21,429.4`** |
+| `MultiCam-4Cam-4step` | `torchtpu-compiled` | `4` | `1,152` | `4` | `16` | **`200.90`** | `201.10` | `211.07` | **`200.90`** | Throughput Tier | **`40,978.5`** |
+| `HighPrecision-2Cam-8step` | `torchtpu-compiled` | `2` | `640` | `8` | `1` | **`73.91`** | `83.16` | `79.05` | **`73.91`** | Throughput Tier | **`1,346.2`** |
+| `HighPrecision-2Cam-8step` | `torchtpu-compiled` | `2` | `640` | `8` | `8` | **`142.30`** | `142.59` | `147.44` | **`142.30`** | Throughput Tier | **`10,819.4`** |
+| `HighPrecision-2Cam-8step` | `torchtpu-compiled` | `2` | `640` | `8` | `16` | **`253.85`** | `254.61` | `258.99` | **`253.85`** | Throughput Tier | **`22,552.8`** |
+| `LongEpisodeMemory-16K-Context-4step` | `torchtpu-compiled` | `2` | `16,384` | `4` | `1` | **`236.26`** | `238.55` | `241.40` | **`236.26`** | Throughput Tier | **`2,527.6`** |
+| `LongEpisodeMemory-64K-Context-4step` | `torchtpu-compiled` | `2` | `65,536` | `4` | `1` | **`2,445.04`** | `2,445.27` | `2,450.18` | **`2,445.04`** | Throughput Tier | **`1,835.7`** |
 
 #### Multi-Camera RGB Vision Preprocessing Ablation (`640x480 -> 256x256`)
 
 | Camera Views | Transform | On-Host CPU (ms) | Disagg Server Compute (ms) | Server Compute Speedup | Sync HTTP RTT (ms) | Async Pipelined Exposed (ms) |
 |---:|---|---:|---:|---:|---:|---:|
-| `1` | `640x480->256x256` | `2.65` | **`4.31`** | **`0.61x`** | `6.67` | **`0.00` *(hidden behind DiT)*** |
-| `2` | `640x480->256x256` | `5.18` | **`5.25`** | **`0.99x`** | `7.92` | **`0.00` *(hidden behind DiT)*** |
-| `4` | `640x480->256x256` | `10.29` | **`7.16`** | **`1.44x`** | `11.13` | **`0.00` *(hidden behind DiT)*** |
+| `1` | `640x480->256x256` | `2.62` | **`4.22`** | **`0.62x`** | `4.88` | **`0.00` *(hidden behind DiT)*** |
+| `2` | `640x480->256x256` | `5.14` | **`5.14`** | **`1.00x`** | `6.15` | **`0.00` *(hidden behind DiT)*** |
+| `4` | `640x480->256x256` | `10.17` | **`6.89`** | **`1.48x`** | `8.36` | **`0.00` *(hidden behind DiT)*** |
 
 ### Slice `v7x-spot-4c` (`v7x`, `8` DP Replicas, `20` Verified Benchmark Points)
 
