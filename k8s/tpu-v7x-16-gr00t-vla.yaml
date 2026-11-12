@@ -1,0 +1,62 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gr00t-vla-tpu-v7x-16
+  namespace: default
+spec:
+  completions: 4
+  parallelism: 4
+  completionMode: Indexed
+  backoffLimit: 4
+  template:
+    spec:
+      restartPolicy: OnFailure
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        cloud.google.com/gke-nodepool: YOUR_TPU_V7X_NODEPOOL
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x4
+      tolerations:
+      - key: google.com/tpu
+        operator: Exists
+        effect: NoSchedule
+      containers:
+      - name: tpu-bench
+        image: us-central1-docker.pkg.dev/YOUR_GCP_PROJECT_ID/vllm/vllm-torchtpu-omni:v0.32.0
+        securityContext:
+          privileged: true
+        env:
+        - name: PJRT_DEVICE
+          value: "TPU"
+        - name: MULTIMODAL_CPU_OFFLOAD_URL
+          value: "http://multimodal-cpu-offload-svc.default.svc.cluster.local:8090"
+        resources:
+          requests:
+            google.com/tpu: "4"
+            memory: "700Gi"
+          limits:
+            google.com/tpu: "4"
+        volumeMounts:
+        - name: dshm
+          mountPath: /dev/shm
+        command:
+        - bash
+        - -lc
+        - |
+          set -euo pipefail
+          python3 -u /workspace/scripts/run_gr00t_vla_tpu_bench.py \
+            --stage-only --chip-type=v7x --slice-name=v7x-16 \
+            --num-hosts=4 --cores-per-host=8 --bucket=YOUR_GCS_BUCKET
+          if [ "${JOB_COMPLETION_INDEX:-0}" != "0" ]; then
+            exit 0
+          fi
+          python3 -u /workspace/scripts/run_gr00t_vla_tpu_bench.py \
+            --chip-type=v7x --slice-name=v7x-16 \
+            --num-hosts=4 --cores-per-host=8 --bucket=YOUR_GCS_BUCKET \
+            --use-shm --output-dir=/workspace/results
+      volumes:
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 850Gi
